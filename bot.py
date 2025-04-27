@@ -1,140 +1,150 @@
+# bot.py  ―― 5 枚の CSV（国語・数学・理科・社会・英語）の中から
+#           毎日 14:30〈日本時間〉に 1 問ランダム出題し、
+#           前日の答え合わせ・月末ランキングも行う完全版
+
 import discord
 from discord.ext import commands, tasks
 import pandas as pd
-import random
-import datetime
-import asyncio
-import os
+import datetime, os, random
 
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-CHANNEL_ID = 913783197748297800
+# ------------------------ Bot 設定 ------------------------
+TOKEN      = os.getenv("DISCORD_BOT_TOKEN")          # Render の環境変数
+CHANNEL_ID = 913783197748297800                      # 出題先チャンネル ID
+JST_HOUR   = 15                                      # 日本時間 14:30 に出題
+JST_MIN    = 15
 
-# CSV読み込み
-quiz_df = pd.read_csv('quiz.csv')
+# ------------------------ CSV 読み込み ------------------------
+csv_files = [
+    "quiz_kokugo.csv",
+    "quiz_math.csv",
+    "quiz_science.csv",
+    "quiz_social.csv",
+    "quiz_english.csv",
+]
+quiz_df = pd.concat([pd.read_csv(f) for f in csv_files], ignore_index=True)
 
-# グローバル変数
-current_quiz = None
-previous_quiz = None
-user_scores = {}  # ユーザーごとの成績記録
+# ------------------------ グローバル ------------------------
+current_quiz  : pd.Series | None = None
+previous_quiz : pd.Series | None = None
+user_scores             = {}   # {user_id: {"correct": int, "total": int}}
 
+# ------------------------ Discord Bot セットアップ ------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# ------------------------ 回答ボタン ------------------------
 class QuizView(discord.ui.View):
-    def __init__(self, quiz):
+    def __init__(self, quiz_row: pd.Series):
         super().__init__(timeout=None)
-        self.quiz = quiz
-        self.correct_answer = int(quiz['answer'])
-        self.answered_users = set()
+        self.correct = int(quiz_row["answer"])
+        self.answered: set[int] = set()
 
-    @discord.ui.button(label="1", style=discord.ButtonStyle.primary)
-    async def button1(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.check_answer(interaction, 1)
-
-    @discord.ui.button(label="2", style=discord.ButtonStyle.primary)
-    async def button2(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.check_answer(interaction, 2)
-
-    @discord.ui.button(label="3", style=discord.ButtonStyle.primary)
-    async def button3(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.check_answer(interaction, 3)
-
-    @discord.ui.button(label="4", style=discord.ButtonStyle.primary)
-    async def button4(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.check_answer(interaction, 4)
-
-    async def check_answer(self, interaction: discord.Interaction, choice: int):
-        if interaction.user.id in self.answered_users:
+    async def check(self, interaction: discord.Interaction, choice: int):
+        uid = interaction.user.id
+        if uid in self.answered:
             await interaction.response.send_message("すでに回答済みです！", ephemeral=True)
             return
-        
-        self.answered_users.add(interaction.user.id)
 
-        # 成績管理
-        if interaction.user.id not in user_scores:
-            user_scores[interaction.user.id] = {"correct": 0, "total": 0}
-        user_scores[interaction.user.id]["total"] += 1
+        self.answered.add(uid)
+        user_scores.setdefault(uid, {"correct": 0, "total": 0})
+        user_scores[uid]["total"] += 1
 
-        if choice == self.correct_answer:
-            user_scores[interaction.user.id]["correct"] += 1
-            await interaction.response.send_message("🎉 正解！おめでとう！", ephemeral=True)
+        if choice == self.correct:
+            user_scores[uid]["correct"] += 1
+            msg = "🎉 **正解！** おめでとう！"
         else:
-            await interaction.response.send_message(f"❌ 不正解！正解は {self.correct_answer} だよ！", ephemeral=True)
+            msg = f"❌ **不正解！** 正解は **{self.correct}** です！"
+        await interaction.response.send_message(msg, ephemeral=True)
 
+    @discord.ui.button(label="1", style=discord.ButtonStyle.primary)
+    async def btn1(self, i, b):  await self.check(i, 1)
+
+    @discord.ui.button(label="2", style=discord.ButtonStyle.primary)
+    async def btn2(self, i, b):  await self.check(i, 2)
+
+    @discord.ui.button(label="3", style=discord.ButtonStyle.primary)
+    async def btn3(self, i, b):  await self.check(i, 3)
+
+    @discord.ui.button(label="4", style=discord.ButtonStyle.primary)
+    async def btn4(self, i, b):  await self.check(i, 4)
+
+# ------------------------ Bot 起動 ------------------------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    send_quiz.start()
+    send_daily_quiz.start()
 
+# ------------------------ 毎分チェックタスク ------------------------
 @tasks.loop(minutes=1)
-async def send_quiz():
+async def send_daily_quiz():
     await bot.wait_until_ready()
-    now = datetime.datetime.now()
-    japan_hour = (now.hour + 9) % 24
-    if japan_hour == 14 and now.minute == 30:
+
+    # UTC → JST
+    now_utc = datetime.datetime.utcnow()
+    jst     = now_utc + datetime.timedelta(hours=9)
+
+    if jst.hour == JST_HOUR and jst.minute == JST_MIN:
         channel = bot.get_channel(CHANNEL_ID)
+        if channel is None:
+            print("⚠️  チャンネル ID が見つかりません")
+            return
 
-        if channel:
-            global previous_quiz, current_quiz
+        global current_quiz, previous_quiz
 
-            # もし前日問題があったら、解説投稿
-            if previous_quiz is not None:
-                answer = previous_quiz['answer']
-                explanation = previous_quiz['explanation']
-                question = previous_quiz['question']
-                await channel.send(f"昨日のクイズの答え合わせ\n\n問題: {question}\n答え: {answer}\n解説: {explanation}")
+        # --- 前日の答え合わせ ---
+        if previous_quiz is not None:
+            await channel.send(
+                "📖 **昨日のクイズ答え合わせ**\n"
+                f"**問題:** {previous_quiz['question']}\n"
+                f"**答え:** {previous_quiz['answer']}\n"
+                f"**解説:** {previous_quiz['explanation']}"
+            )
 
-            # 月末ならランキング発表して成績リセット
-            if now.day == get_last_day_of_month(now.year, now.month):
-                await announce_ranking(channel)
-                user_scores.clear()
+        # --- 月末ならランキング ---
+        if jst.day == last_day_of_month(jst.year, jst.month):
+            await announce_ranking(channel)
+            user_scores.clear()
 
-            # 新しいクイズを出題
-            current_quiz = quiz_df.sample(1).iloc[0]
-            previous_quiz = current_quiz.copy()
+        # --- 本日のクイズ出題 ---
+        current_quiz  = quiz_df.sample(1).iloc[0]
+        previous_quiz = current_quiz.copy()
 
-            question_text = f"Today's Quiz\n{current_quiz['question']}\n"
-            choices = [
-                f"1. {current_quiz['choice1']}",
-                f"2. {current_quiz['choice2']}",
-                f"3. {current_quiz['choice3']}",
-                f"4. {current_quiz['choice4']}",
-            ]
-            question_text += "\n".join(choices)
+        text = (
+            "📚 **Today's Quiz** 📚\n"
+            f"{current_quiz['question']}\n"
+            f"1. {current_quiz['choice1']}\n"
+            f"2. {current_quiz['choice2']}\n"
+            f"3. {current_quiz['choice3']}\n"
+            f"4. {current_quiz['choice4']}"
+        )
+        await channel.send(text, view=QuizView(current_quiz))
 
-            view = QuizView(current_quiz)
-            await channel.send(question_text, view=view)
-
-        else:
-            print("チャンネルが見つかりません。CHANNEL_IDを確認してください。")
-
-# 月末日判定関数
-def get_last_day_of_month(year, month):
-    if month == 12:
-        return 31
-    next_month = datetime.date(year, month + 1, 1)
-    last_day = (next_month - datetime.timedelta(days=1)).day
-    return last_day
-
-# 正答率ランキング発表関数
-async def announce_ranking(channel):
+# ------------------------ ランキング ------------------------
+async def announce_ranking(channel: discord.TextChannel):
     if not user_scores:
-        await channel.send("🏆 今月は記録がありませんでした。")
+        await channel.send("🏆 今月は成績記録がありませんでした。")
         return
 
-    ranking = []
-    for user_id, scores in user_scores.items():
-        if scores["total"] > 0:
-            accuracy = scores["correct"] / scores["total"] * 100
-            ranking.append((user_id, accuracy, scores["correct"], scores["total"]))
+    ranking = sorted(
+        (
+            (uid, sc["correct"], sc["total"])
+            for uid, sc in user_scores.items() if sc["total"] > 0
+        ),
+        key=lambda x: x[1] / x[2],
+        reverse=True
+    )
 
-    ranking.sort(key=lambda x: x[1], reverse=True)  # 正答率順に並び替え
+    lines = ["🏆 **今月のクイズチャンピオン** 🏆\n"]
+    for i, (uid, cor, tot) in enumerate(ranking, 1):
+        acc = cor / tot * 100
+        lines.append(f"{i}位 <@{uid}> — {acc:.1f}% ({cor}/{tot})")
+    await channel.send("\n".join(lines))
 
-    message = "今月のクイズチャンピオン発表！\n\n"
-    for i, (user_id, accuracy, correct, total) in enumerate(ranking, start=1):
-        message += f"{i}位 <@{user_id}> - 正答率: {accuracy:.1f}% ({correct}/{total})\n"
+# ------------------------ ヘルパ ------------------------
+def last_day_of_month(year: int, month: int) -> int:
+    nxt = datetime.date(year + month // 12, month % 12 + 1, 1)
+    return (nxt - datetime.timedelta(days=1)).day
 
-    await channel.send(message)
-
+# ------------------------ Run ------------------------
 bot.run(TOKEN)
