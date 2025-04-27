@@ -72,7 +72,7 @@ async def send_quiz():
     await bot.wait_until_ready()
     now = datetime.datetime.now()
     japan_hour = (now.hour + 9) % 24
-    if japan_hour == 13 and now.minute == 0:
+    if japan_hour == 14 and now.minute == 30:
         channel = bot.get_channel(CHANNEL_ID)
 
         if channel:
@@ -94,7 +94,7 @@ async def send_quiz():
             current_quiz = quiz_df.sample(1).iloc[0]
             previous_quiz = current_quiz.copy()
 
-            question_text = f"Today's English Quiz\n{current_quiz['question']}\n"
+            question_text = f"Today's Quiz\n{current_quiz['question']}\n"
             choices = [
                 f"1. {current_quiz['choice1']}",
                 f"2. {current_quiz['choice2']}",
