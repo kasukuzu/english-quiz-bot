@@ -1,17 +1,15 @@
-# bot.py  ―― 5 枚の CSV（国語・数学・理科・社会・英語）の中から
-#           毎日 15:15〈日本時間〉に 1 問ランダム出題し、
-#           前日の答え合わせ・月末ランキングも行う完全版＋!test機能付き
+# bot.py ―― 5枚のCSVから毎日ランダム出題＋成績保存版
 
 import discord
 from discord.ext import commands, tasks
 import pandas as pd
-import datetime, os, random
+import datetime, os, random, json
 
 # ------------------------ Bot 設定 ------------------------
 TOKEN      = os.getenv("DISCORD_BOT_TOKEN")
 CHANNEL_ID = 913783197748297800
-JST_HOUR   = 15
-JST_MIN    = 15
+JST_HOUR   = 8
+JST_MIN    = 00
 
 # ------------------------ CSV 読み込み ------------------------
 csv_files = [
@@ -26,7 +24,22 @@ quiz_df = pd.concat([pd.read_csv(f) for f in csv_files], ignore_index=True)
 # ------------------------ グローバル ------------------------
 current_quiz  : pd.Series | None = None
 previous_quiz : pd.Series | None = None
-user_scores             = {}
+user_scores             = {}  # {user_id: {"correct": int, "total": int}}
+SCORES_FILE = "scores.json"
+
+# ------------------------ 成績保存/読み込み ------------------------
+def load_scores():
+    global user_scores
+    if os.path.exists(SCORES_FILE):
+        with open(SCORES_FILE, "r", encoding="utf-8") as f:
+            user_scores = json.load(f)
+            user_scores = {int(k): v for k, v in user_scores.items()}
+    else:
+        user_scores = {}
+
+def save_scores():
+    with open(SCORES_FILE, "w", encoding="utf-8") as f:
+        json.dump(user_scores, f, ensure_ascii=False, indent=2)
 
 # ------------------------ Discord Bot セットアップ ------------------------
 intents = discord.Intents.default()
@@ -39,7 +52,7 @@ class QuizView(discord.ui.View):
         super().__init__(timeout=None)
         self.correct = int(quiz_row["answer"])
         self.explanation = quiz_row["explanation"]
-        self.record_score = record_score  # <- スコア記録するか
+        self.record_score = record_score
         self.answered: set[int] = set()
 
     async def check(self, interaction: discord.Interaction, choice: int):
@@ -53,10 +66,11 @@ class QuizView(discord.ui.View):
         if self.record_score:
             user_scores.setdefault(uid, {"correct": 0, "total": 0})
             user_scores[uid]["total"] += 1
+            if choice == self.correct:
+                user_scores[uid]["correct"] += 1
+            save_scores()  # 回答後に保存！
 
         if choice == self.correct:
-            if self.record_score:
-                user_scores[uid]["correct"] += 1
             msg = "🎉 **正解！** おめでとう！"
         else:
             msg = f"❌ **不正解！** 正解は **{self.correct}** です！"
@@ -79,6 +93,7 @@ class QuizView(discord.ui.View):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    load_scores()  # 起動時にスコア読み込み
     send_daily_quiz.start()
 
 # ------------------------ 毎分チェックタスク ------------------------
@@ -110,6 +125,7 @@ async def send_daily_quiz():
         if jst.day == last_day_of_month(jst.year, jst.month):
             await announce_ranking(channel)
             user_scores.clear()
+            save_scores()  # リセット後に保存
 
         # --- 今日のクイズ出題 ---
         current_quiz  = quiz_df.sample(1).iloc[0]
