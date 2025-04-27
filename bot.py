@@ -71,7 +71,7 @@ async def on_ready():
 async def send_quiz():
     await bot.wait_until_ready()
     now = datetime.datetime.now()
-    if now.hour == 11 and now.minute == 0:
+    if now.hour == 12 and now.minute == 0:
         channel = bot.get_channel(CHANNEL_ID)
 
         if channel:
