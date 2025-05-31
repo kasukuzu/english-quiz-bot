@@ -1,4 +1,4 @@
-# bot.py ―― 5枚のCSVから毎日ランダム出題＋成績保存版
+# bot.py ―― 5枚のCSVから毎日ランダム出題＋成績保存＋被りなし＋24時間制限付き版
 
 import discord
 from discord.ext import commands, tasks
@@ -9,7 +9,7 @@ import datetime, os, random, json
 TOKEN      = os.getenv("DISCORD_BOT_TOKEN")
 CHANNEL_ID = 913783197748297800
 JST_HOUR   = 8
-JST_MIN    = 00
+JST_MIN    = 0
 
 # ------------------------ CSV 読み込み ------------------------
 csv_files = [
@@ -26,6 +26,8 @@ current_quiz  : pd.Series | None = None
 previous_quiz : pd.Series | None = None
 user_scores             = {}  # {user_id: {"correct": int, "total": int}}
 SCORES_FILE = "scores.json"
+USED_FILE = "used_indices.json"
+quiz_post_time = None  # 出題時刻（UTC）
 
 # ------------------------ 成績保存/読み込み ------------------------
 def load_scores():
@@ -40,6 +42,29 @@ def load_scores():
 def save_scores():
     with open(SCORES_FILE, "w", encoding="utf-8") as f:
         json.dump(user_scores, f, ensure_ascii=False, indent=2)
+
+# ------------------------ 被り防止 ------------------------
+def load_used_indices():
+    if os.path.exists(USED_FILE):
+        with open(USED_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+def save_used_indices(indices):
+    with open(USED_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(indices), f)
+
+def get_unique_quiz():
+    total = len(quiz_df)
+    used = load_used_indices()
+    remaining = set(range(total)) - used
+    if not remaining:
+        used.clear()
+        remaining = set(range(total))
+    selected = random.choice(list(remaining))
+    used.add(selected)
+    save_used_indices(used)
+    return quiz_df.iloc[selected]
 
 # ------------------------ Discord Bot セットアップ ------------------------
 intents = discord.Intents.default()
@@ -61,6 +86,12 @@ class QuizView(discord.ui.View):
             await interaction.response.send_message("すでに回答済みです！", ephemeral=True)
             return
 
+        # 出題から24時間以内か確認
+        now = datetime.datetime.utcnow()
+        if quiz_post_time and (now - quiz_post_time) > datetime.timedelta(hours=24):
+            await interaction.response.send_message("⏳ この問題の回答時間は終了しました。", ephemeral=True)
+            return
+
         self.answered.add(uid)
 
         if self.record_score:
@@ -68,7 +99,7 @@ class QuizView(discord.ui.View):
             user_scores[uid]["total"] += 1
             if choice == self.correct:
                 user_scores[uid]["correct"] += 1
-            save_scores()  # 回答後に保存！
+            save_scores()
 
         if choice == self.correct:
             msg = "🎉 **正解！** おめでとう！"
@@ -93,7 +124,7 @@ class QuizView(discord.ui.View):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    load_scores()  # 起動時にスコア読み込み
+    load_scores()
     send_daily_quiz.start()
 
 # ------------------------ 毎分チェックタスク ------------------------
@@ -110,9 +141,8 @@ async def send_daily_quiz():
             print("⚠️ チャンネル ID が見つかりません")
             return
 
-        global current_quiz, previous_quiz
+        global current_quiz, previous_quiz, quiz_post_time
 
-        # --- 前日の答え合わせ ---
         if previous_quiz is not None:
             await channel.send(
                 "📖 **昨日のクイズ答え合わせ**\n"
@@ -121,15 +151,14 @@ async def send_daily_quiz():
                 f"**解説:** {previous_quiz['explanation']}"
             )
 
-        # --- 月末ならランキング ---
         if jst.day == last_day_of_month(jst.year, jst.month):
             await announce_ranking(channel)
             user_scores.clear()
-            save_scores()  # リセット後に保存
+            save_scores()
 
-        # --- 今日のクイズ出題 ---
-        current_quiz  = quiz_df.sample(1).iloc[0]
+        current_quiz  = get_unique_quiz()
         previous_quiz = current_quiz.copy()
+        quiz_post_time = datetime.datetime.utcnow()  # 出題時間を記録（UTC）
 
         text = (
             "📚 **Today's Quiz** 📚\n"
@@ -144,8 +173,7 @@ async def send_daily_quiz():
 # ------------------------ 手動テストコマンド (!test) ------------------------
 @bot.command()
 async def test(ctx):
-    """!test と打つとランキング対象外で1問出題"""
-    quiz = quiz_df.sample(1).iloc[0]
+    quiz = get_unique_quiz()
 
     text = (
         "🧪 **Test Quiz** 🧪\n"
@@ -159,27 +187,34 @@ async def test(ctx):
 
 # ------------------------ ランキング ------------------------
 async def announce_ranking(channel: discord.TextChannel):
+    """正答数ベースでランキングを作成"""
     if not user_scores:
         await channel.send("🏆 今月は成績記録がありませんでした。")
         return
 
+    # --- 正答数でソート（同数の場合は回答数の多い方を上位） ---
     ranking = sorted(
         (
             (uid, sc["correct"], sc["total"])
             for uid, sc in user_scores.items() if sc["total"] > 0
         ),
-        key=lambda x: x[1] / x[2],
+        key=lambda x: (x[1], x[2]),  # 正答数 → 回答数
         reverse=True
     )
 
-    lines = ["🏆 **今月のクイズチャンピオン** 🏆\n"]
+    lines = ["🏆 **今月のクイズチャンピオン（正答数）** 🏆"]
     for i, (uid, cor, tot) in enumerate(ranking, 1):
-        acc = cor / tot * 100
-        lines.append(f"{i}位 <@{uid}> — {acc:.1f}% ({cor}/{tot})")
-    await channel.send("\n".join(lines))
+        lines.append(f"{i}位 <@{uid}> — 正答数: {cor} / 回答数: {tot}")
+    await channel.send("".join(lines))
 
 # ------------------------ ヘルパ ------------------------
+
+import datetime
+
 def last_day_of_month(year: int, month: int) -> int:
+    """
+    指定した年月の月末日（31, 30, 29, 28 など）を返す
+    """
     nxt = datetime.date(year + month // 12, month % 12 + 1, 1)
     return (nxt - datetime.timedelta(days=1)).day
 
