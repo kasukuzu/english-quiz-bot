@@ -183,10 +183,12 @@ async def send_daily_quiz():
 
     await safe_send(ch, "\n\n".join(parts), view=QuizView(current_quiz))
 
-# ------------ !test ------------
+# ------ 手動テストコマンド (!test) ------
 @bot.command()
 async def test(ctx):
+    """!test と打つとランキング対象外で1問出題"""
     quiz = get_unique_quiz()
+
     txt = (
         "🧪 **Test Quiz** 🧪\n"
         f"{quiz['question']}\n"
@@ -195,7 +197,8 @@ async def test(ctx):
         f"3. {quiz['choice3']}\n"
         f"4. {quiz['choice4']}"
     )
-    await safe_send(ctx, txt, view=QuizView(quiz, record_score=False))
+    # ★ record_score 引数を削除
+    await safe_send(ctx, txt, view=QuizView(quiz))
 
 # ------------ Run ------------
 bot.run(TOKEN)
